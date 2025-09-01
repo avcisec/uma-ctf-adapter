@@ -1,14 +1,20 @@
 {
+  "lib/uma-ctf-adapter": {
+    "tag": {
+      "name": "v3.1.0",
+      "rev": "10dd8829d710ed9c2541b4196b463ad0c90546fc"
+    }
+  },
   "lib/forge-std": {
     "tag": {
       "name": "v1.10.0",
       "rev": "8bbcf6e3f8f62f419e5429a0bd89331c85c37824"
     }
   },
-  "lib/uma-ctf-adapter": {
+  "lib/openzeppelin-contracts": {
     "tag": {
-      "name": "v3.1.0",
-      "rev": "10dd8829d710ed9c2541b4196b463ad0c90546fc"
+      "name": "v4.7.0",
+      "rev": "8c49ad74eae76ee389d038780d407cf90b4ae1de"
     }
   }
 }

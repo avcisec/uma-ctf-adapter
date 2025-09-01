@@ -4,3 +4,6 @@
 [submodule "lib/uma-ctf-adapter"]
 	path = lib/uma-ctf-adapter
 	url = https://github.com/Polymarket/uma-ctf-adapter
+[submodule "lib/openzeppelin-contracts"]
+	path = lib/openzeppelin-contracts
+	url = https://github.com/openzeppelin/openzeppelin-contracts
