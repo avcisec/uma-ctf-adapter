@@ -1,24 +1,25 @@
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.15;
+//SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
 
 import { IERC20 } from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
-import { Auth } from "uma-ctf-adapter/mixins/Auth.sol";
-import { BulletinBoard } from "uma-ctf-adapter/mixins/BulletinBoard.sol";
+import { Auth } from "./mixins/Auth.sol";
+import { BulletinBoard } from "./mixins/BulletinBoard.sol";
 
-import { TransferHelper } from "uma-ctf-adapter/libraries/TransferHelper.sol";
-import { PayoutHelperLib } from "uma-ctf-adapter/libraries/PayoutHelperLib.sol";
-import { AncillaryDataLib } from "uma-ctf-adapter/libraries/AncillaryDataLib.sol";
+import { TransferHelper } from "./libraries/TransferHelper.sol";
+import { PayoutHelperLib } from "./libraries/PayoutHelperLib.sol";
+import { AncillaryDataLib } from "./libraries/AncillaryDataLib.sol";
 
-import { IFinder } from "uma-ctf-adapter/interfaces/IFinder.sol";
-import { IAddressWhitelist } from "uma-ctf-adapter/interfaces/IAddressWhitelist.sol";
-import { IConditionalTokens } from "uma-ctf-adapter/interfaces/IConditionalTokens.sol";
-import { IOptimisticOracleV2 } from "uma-ctf-adapter/interfaces/IOptimisticOracleV2.sol";
-import { IOptimisticRequester } from "uma-ctf-adapter/interfaces/IOptimisticRequester.sol";
+import { IFinder } from "./interfaces/IFinder.sol";
+import { IAddressWhitelist } from "./interfaces/IAddressWhitelist.sol";
+import { IConditionalTokens } from "./interfaces/IConditionalTokens.sol";
+import { IOptimisticOracleV2 } from "./interfaces/IOptimisticOracleV2.sol";
+import { IOptimisticRequester } from "./interfaces/IOptimisticRequester.sol";
 
-import { QuestionData, IUmaCtfAdapter } from "uma-ctf-adapter/interfaces/IUmaCtfAdapter.sol";
+import { QuestionData, IUmaCtfAdapter } from "./interfaces/IUmaCtfAdapter.sol";
 
-import { LayerZeroRelayer } from "./LayerZeroRelayer.sol";
+import { ICTFRelayer } from "./interfaces/ICTFRelayer.sol";
+import { OptionsBuilder } from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OptionsBuilder.sol";
 
 /* BASE CHAIN */
 // This contract will be deployed on the Base chain
@@ -44,11 +45,13 @@ USDC is not available on hyperEVM. USDT will be used.
 /// @author 0xBlockBamba
 
 contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticRequester {
+    using OptionsBuilder for bytes;
     /*///////////////////////////////////////////////////////////////////
                             IMMUTABLES 
     //////////////////////////////////////////////////////////////////*/
-    /// @notice Conditional Tokens Framework
-    IConditionalTokens public immutable ctf;
+
+    /// @notice CTF Relayer
+    ICTFRelayer public immutable ctfRelayer;
 
     /// @notice Optimistic Oracle
     IOptimisticOracleV2 public immutable optimisticOracle;
@@ -67,6 +70,11 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
     /// From OOV2 function OO_ANCILLARY_DATA_LIMIT
     uint256 public constant MAX_ANCILLARY_DATA = 8139;
 
+    uint256 public constant LZ_FEE_BUFFER = 0;
+
+    /// @notice Destination EID
+    uint32 public dstEid;
+
     /// @notice Mapping of questionID to QuestionData
     mapping(bytes32 => QuestionData) public questions;
 
@@ -75,11 +83,12 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         _;
     }
 
-    /// @param _ctf     - The Conditional Token Framework Address
+
     ///                 - When deployed for negative risk markets, this should be the `NegRiskOperator` contract address
     /// @param _finder  - The UMA Finder contract address
-    constructor(address _ctf, address _finder) {
-        ctf = IConditionalTokens(_ctf);
+    /// @param _ctfRelayer - The LayerZero _ctfRelayer contract address
+    constructor(address _finder, address _ctfRelayer) {
+        ctfRelayer = ICTFRelayer(_ctfRelayer);
         IFinder finder = IFinder(_finder);
         optimisticOracle = IOptimisticOracleV2(finder.getImplementationAddress("OptimisticOracleV2"));
         collateralWhitelist = IAddressWhitelist(finder.getImplementationAddress("CollateralWhitelist"));
@@ -112,9 +121,9 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         uint256 reward,
         uint256 proposalBond,
         uint256 liveness
-    ) external returns (bytes32 questionID) {
+    ) external payable returns (bytes32 questionID) {
         if (!collateralWhitelist.isOnWhitelist(rewardToken)) revert UnsupportedToken();
-
+        
         bytes memory data = AncillaryDataLib._appendAncillaryData(msg.sender, ancillaryData);
         if (ancillaryData.length == 0 || data.length > MAX_ANCILLARY_DATA) revert InvalidAncillaryData();
 
@@ -123,12 +132,25 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         if (_isInitialized(questions[questionID])) revert Initialized();
 
         uint256 timestamp = block.timestamp;
+        uint256 fee = msg.value;
+        uint32 _dstEid = dstEid;
+        // bunu ayri bir fonksiyonun icinde parametre alacak sekilde yapmak lazim
+        // Define options for layerZero communication
+        bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(200000, 0);
+
+        // get expected message fee for requesting condition prepare. 
+        uint256 expectedFee = ctfRelayer.getPrepareConditionFee(_dstEid,questionID,2,options,false);
+
+        // add some buffer to not reverted. LayerZero refunds the extra to sender.
+        uint256 requiredFee = expectedFee + LZ_FEE_BUFFER;
+
+        if (fee < requiredFee) revert InsufficientFee(requiredFee,fee);
 
         // Persist the question parameters in storage
         _saveQuestion(msg.sender, questionID, data, timestamp, rewardToken, reward, proposalBond, liveness);
 
-        // Send payload to LayerZero relayer contract for preparing the question on the CTF
-        LayerZeroRelayer.prepareCondition(address(this), questionID, 2);
+        // send payload to layerZero Relayer.
+        ctfRelayer.prepareCondition{value: requiredFee}(_dstEid, questionID, 2, options);
 
         // Request a price for the question from the OO
         _requestPrice(msg.sender, timestamp, data, rewardToken, reward, proposalBond, liveness);
@@ -136,27 +158,75 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         emit QuestionInitialized(questionID, timestamp, msg.sender, data, rewardToken, reward, proposalBond);
     }
 
+    function getPrepareConditionFee(bytes32 _questionId, uint8 _outcomeSlotCount) public view returns (uint256 fee) {
+        // Define options for layerZero communication
+        bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(200000, 0);
+        uint32 _dstEid = dstEid;
+        // get expected message fee for requesting condition prepare. 
+        uint256 expectedFee = ctfRelayer.getPrepareConditionFee(_dstEid,_questionId,_outcomeSlotCount,options,false);
+
+        return expectedFee;
+
+    }
+
+    function getReportPayoutsFee(bytes32 _questionId, uint[] calldata _payouts) public view returns (uint256 fee){
+        // Define options for layerZero communication
+        bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(200000, 0);
+        uint32 _dstEid = dstEid;
+        // get expected message fee for requesting condition prepare. 
+        uint256 expectedFee = ctfRelayer.getReportPayoutsFee(_dstEid,_questionId,_payouts,options,false);
+        return expectedFee;
+    }
+
+    
+
     /// @notice Checks whether a questionID is ready to be resolved
     /// @param questionID - The unique questionID
     function ready(bytes32 questionID) public view returns (bool) {
         return _ready(questions[questionID]);
     }
+    
 
     /// @notice Resolves a question
     /// Pulls price information from the OO and resolves the underlying CTF market.
     /// Reverts if price is not available on the OO
     /// Resets the question if the price returned by the OO is the Ignore price
     /// @param questionID - The unique questionID of the question
-    function resolve(bytes32 questionID) external {
+    function resolve(bytes32 questionID) external payable{
         QuestionData storage questionData = questions[questionID];
-
+        bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(200000, 0);
+        uint256 fee = msg.value;
+        uint32 _dstEid = dstEid;
         if (!_isInitialized(questionData)) revert NotInitialized();
         if (questionData.paused) revert Paused();
         if (questionData.resolved) revert Resolved();
         if (!_hasPrice(questionData)) revert NotReadyToResolve();
 
-        // Resolve the underlying market
-        return _resolve(questionID, questionData);
+
+
+        // Get the price from the OO
+        int256 price = optimisticOracle.settleAndGetPrice(
+            YES_OR_NO_IDENTIFIER, questionData.requestTimestamp, questionData.ancillaryData
+        );
+
+        // If the OO returns the ignore price, reset the question
+        if (price == _ignorePrice()) return _reset(address(this), questionID, true, questionData);
+
+        // Set resolved flag
+        questionData.resolved = true;
+
+        // If refund flag is set, this indicates that the question's reward now sits on the Adapter.
+        // Refund the reward to the question creator on resolution
+        if (questionData.refund) _refund(questionData);
+
+        // Construct the payout array for the question
+        uint256[] memory payouts = _constructPayouts(price);
+        uint256 expectedFee = ctfRelayer.getReportPayoutsFee(_dstEid,questionID,payouts,options,false);
+        uint256 requiredFee = expectedFee + LZ_FEE_BUFFER;
+        if (fee < requiredFee) revert InsufficientFee(requiredFee,fee);
+        ctfRelayer.reportPayouts{value: requiredFee}(_dstEid,questionID, payouts, options);
+        emit QuestionResolved(questionID, price, payouts);
+
     }
 
     /// @notice Retrieves the expected payout array of the question
@@ -225,6 +295,14 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
                             ADMIN ONLY FUNCTIONS 
     ///////////////////////////////////////////////////////////////////*/
 
+    /// @notice Set the destination EID
+    /// @param _dstEid The destination EID
+    /// @dev Only the owner can set the destination EID
+    function setDstEid(uint32 _dstEid) external onlyAdmin {
+        dstEid = _dstEid;
+        emit DstEidSet(_dstEid);
+    }
+
     /// @notice Flags a market for emergency resolution
     /// @param questionID - The unique questionID of the question
     function flag(bytes32 questionID) external onlyAdmin {
@@ -274,7 +352,7 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
     /// @notice Allows an admin to resolve a CTF market in an emergency
     /// @param questionID   - The unique questionID of the question
     /// @param payouts      - Array of position payouts for the referenced question
-    function emergencyResolve(bytes32 questionID, uint256[] calldata payouts) external onlyAdmin {
+    function emergencyResolve(bytes32 questionID, uint256[] calldata payouts) external payable onlyAdmin {
         QuestionData storage questionData = questions[questionID];
 
         if (!_isValidPayoutArray(payouts)) revert InvalidPayouts();
@@ -287,7 +365,17 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         // Refund the reward to the question creator if necessary
         if (questionData.refund) _refund(questionData);
 
-        LayerZeroRelayer.reportPayouts(questionID, payouts);
+        uint256 fee = msg.value;
+        uint32 _dstEid = dstEid;
+        // Prepare options for payload
+        bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(200000, 0);
+        // calculate expected fee for layerZero Message
+        uint256 expectedFee = ctfRelayer.getReportPayoutsFee(_dstEid,questionID,payouts,options,false);
+        // add some buffer to not reverted. LayerZero refunds the extra to sender.
+        uint256 requiredFee = expectedFee + LZ_FEE_BUFFER;
+        if (fee < requiredFee) revert InsufficientFee(requiredFee,fee);
+        // Resolve the underlying CTF market
+        ctfRelayer.reportPayouts{value: requiredFee}(_dstEid, questionID, payouts, options);
         emit QuestionEmergencyResolved(questionID, payouts);
     }
 
@@ -431,33 +519,6 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
         emit QuestionReset(questionID);
     }
 
-    /// @notice Resolves the underlying CTF market
-    /// @param questionID   - The unique questionID of the question
-    /// @param questionData - The question data parameters
-    function _resolve(bytes32 questionID, QuestionData storage questionData) internal {
-        // Get the price from the OO
-        int256 price = optimisticOracle.settleAndGetPrice(
-            YES_OR_NO_IDENTIFIER, questionData.requestTimestamp, questionData.ancillaryData
-        );
-
-        // If the OO returns the ignore price, reset the question
-        if (price == _ignorePrice()) return _reset(address(this), questionID, true, questionData);
-
-        // Set resolved flag
-        questionData.resolved = true;
-
-        // If refund flag is set, this indicates that the question's reward now sits on the Adapter.
-        // Refund the reward to the question creator on resolution
-        if (questionData.refund) _refund(questionData);
-
-        // Construct the payout array for the question
-        uint256[] memory payouts = _constructPayouts(price);
-
-        // Resolve the underlying CTF market
-        LayerZeroRelayer.reportPayouts(questionID, payouts);
-
-        emit QuestionResolved(questionID, price, payouts);
-    }
 
     function _hasPrice(QuestionData storage questionData) internal view returns (bool) {
         return optimisticOracle.hasPrice(
@@ -511,5 +572,7 @@ contract HypiqUmaCtfAdapter is IUmaCtfAdapter, Auth, BulletinBoard, IOptimisticR
     function _ignorePrice() internal pure returns (int256) {
         return type(int256).min;
     }
+
+
 }
   
